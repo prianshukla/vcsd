@@ -1,391 +1,353 @@
-# VCSD-SimpleSSD Integration Plan
-**Goal**: Integrate VCSD cryptographic secure deletion with SimpleSSD for performance evaluation against state-of-the-art secure deletion algorithms
+# VCSD Implementation Analysis & Proper Integration Plan
+
+## Analysis of Figures (Comparison Metrics Required)
+
+### Figure 10: Baseline Comparison
+**Metrics to measure**:
+1. **Deletion cost** (microseconds) - Time to complete deletion
+2. **Number of erasures** - Physical block erases performed
+3. **Number of migrations** - Valid pages moved during GC
+
+**Algorithms compared**:
+- **Erasure-based** (traditional): Physical block erase
+- **Cryptography-based** (VCSD): Key deletion
+- **ErasuCrypto-Greedy/Graph/ILP**: Hybrid approaches
+
+### Figure 11: GC Impact
+**Metrics**:
+1. **Erasures by GC** - Block erases triggered by garbage collection
+2. **Migrations by GC** - Data movement during GC
+
+### Figure 12: System Performance
+**Metrics**:
+1. **Program overall delay** (seconds) - Total system latency
+2. **Energy consumption** (joules) - Power cost
 
 ---
 
-## Phase 1: AES-GCM Encryption Layer (Week 1-2)
+## What's Actually Implemented (and WHY)
 
-### 1.1 **Create Encryption/Deletion Manager (EDM)**
-**Location**: `vcsd/core/edm/`
+### ✅ 1. **PuncturablePRF** (`ppk/puncturable_prf.cc`)
+**Purpose**: File-level key management with physical deletion
+**Used for**: 
+- Derive per-file keys
+- **Puncture operation** = cryptographic deletion (VCSD core)
+- Track epochs for file reuse
 
-**Files to create**:
-- `encryption_manager.hh/cc` - AES-256-GCM encryption/decryption
-- `deletion_policy.hh/cc` - Policy definitions (VCSD, CRYPTOERASE, OVERWRITE, SANITIZE)
-- `baseline_algorithms.hh/cc` - Implementations of comparison algorithms
+**Metrics it provides**:
+- Puncture latency (~0.5μs)
+- Number of punctured files
 
-**Functionality**:
+### ✅ 2. **Merkle Tree** (`merkle/merkle_tree.cc`)
+**Purpose**: State commitment for verifiable deletion
+**Used for**:
+- Compute hash of system state (which blocks are valid/invalid)
+- Part of PCD receipt for auditing
+
+**Metrics it provides**:
+- Merkle computation time (~100μs for 1000 chunks)
+- Proof size (log N)
+
+### ✅ 3. **PCD Generator** (`pcd/pcd_generator.cc`)
+**Purpose**: Generate cryptographically-signed deletion receipts
+**Used for**:
+- Prove deletion happened (pre-state → post-state transition)
+- Include deletion plan (what was punctured, what was erased)
+- Signature for non-repudiation
+
+**Components**:
+- **SystemSnapshot**: Merkle root of chunk bitmaps
+- **DeletionPlan**: PPK punctures + block erasures
+- **Receipt**: Signed proof with pre/post states
+
+**Metrics it provides**:
+- Receipt generation time (~150μs signing)
+- Proof storage size (< 1KB per deletion)
+
+### ✅ 4. **VCSD Controller** (`interface/vcsd_controller.cc`)
+**Purpose**: Orchestrates all operations
+**Current state**: Already handles write/read/trim with latency modeling
+
+---
+
+## What's MISSING (Integration Gaps)
+
+### ❌ 1. **PCD Integration in deletion path**
+Current `processTrim()` does:
 ```cpp
-class EncryptionManager {
-    // Actual AES-GCM encryption (not just simulation)
-    bool encryptPage(const uint8_t* pageKey, const uint8_t* plaintext, 
-                     size_t len, uint8_t* ciphertext, uint8_t* tag);
+prf_->puncture(groupId);  // ✓ Punctures
+// ❌ Does NOT generate PCD receipt
+// ❌ Does NOT compute Merkle root
+// ❌ Does NOT track system state
+```
+
+### ❌ 2. **Baseline algorithm implementations**
+Need traditional erasure-based for comparison
+
+### ❌ 3. **SimpleSSD FTL integration**
+VCSD Controller is standalone, not integrated with SimpleSSD
+
+### ❌ 4. **Metrics collection for publication**
+Not tracking:
+- Number of erasures
+- Number of migrations
+- Energy consumption
+- GC impact
+
+---
+
+## Correct Architecture (Using ALL Components)
+
+```
+SimpleSSD FTL (modified)
+    ↓ receives trim request
+VCSDController::processTrim()
+    ├─ Track pre-state
+    ├─ Create SystemSnapshot (Merkle root of valid blocks)
+    ├─ Execute deletion:
+    │   ├─ VCSD: prf_->puncture(groupId)  [~0.5μs]
+    │   │   └─ No block erase, no migration
+    │   │
+    │   └─ Baseline: performBlockErase()  [~2ms + migrations]
+    │       └─ Erase blocks + migrate valid pages
+    ├─ Track post-state
+    ├─ Generate PCD receipt (with Merkle roots)  [~150μs]
+    │   ├─ Sign with Ed25519
+    │   └─ Include deletion plan
+    ├─ Measure all metrics:
+    │   ├─ Deletion latency
+    │   ├─ Number of erasures
+    │   ├─ Number of migrations
+    │   └─ Energy cost
+    └─ Return total latency
+```
+
+---
+
+## Proper Implementation Plan
+
+### Phase 1: Complete VCSD Deletion Path (WITH PCD)
+
+**File**: `vcsd/interface/vcsd_controller.hh`
+```cpp
+class VCSDController {
+private:
+    std::unique_ptr<PPK::PuncturablePRF> prf_;
+    std::unique_ptr<PCD::PcdGenerator> pcdGenerator_;  // ADD THIS
     
-    bool decryptPage(const uint8_t* pageKey, const uint8_t* ciphertext,
-                     size_t len, const uint8_t* tag, uint8_t* plaintext);
+    // System state tracking
+    std::vector<uint8_t> blockValidBitmap_;  // Which blocks have valid data
     
-    // Integrate with existing PuncturablePRF
-    PuncturablePRF* prf_;
+public:
+    // Enhanced deletion with PCD generation
+    struct DeletionResult {
+        uint64_t latency;
+        uint32_t numErasures;
+        uint32_t numMigrations;
+        uint64_t energyCost;
+        PCD::Receipt receipt;  // Cryptographic proof
+    };
+    
+    DeletionResult processSecureDeletion(uint64_t groupId, ...);
 };
 ```
 
-**Dependencies**:
-- OpenSSL EVP_aes_256_gcm()
-- Existing PuncturablePRF for key derivation
-- Use master key from config (not just stored but actively used)
-
----
-
-## Phase 2: FTL Integration (Week 2-3)
-
-### 2.1 **Extend FTL with Crypto Operations**
-**Location**: `simplessd/ftl/` (modify existing)
-
-**Files to modify**:
-- `page_mapping.cc` - Add encryption on write, decryption on read
-- `page_mapping.hh` - Add EDM pointer and crypto interfaces
-- `ftl.hh` - Add VCSD parameters
-
-**Key Changes**:
-1. **Write Path**:
-   ```cpp
-   void PageMapping::writeIntern al(Request &req, uint64_t &tick, bool isGC) {
-       // Derive page key from LPN
-       uint8_t pageKey[32];
-       edm_->derivePageKey(req.lpn, version, pageKey);
-       
-       // Encrypt data before writing to flash
-       uint8_t ciphertext[PAGE_SIZE];
-       uint8_t tag[16];
-       edm_->encryptPage(pageKey, plaintext, PAGE_SIZE, ciphertext, tag);
-       
-       // Store ciphertext + tag to flash via PAL
-       // ...existing write logic...
-   }
-   ```
-
-2. **Read Path**:
-   ```cpp
-   void PageMapping::readInternal(Request &req, uint64_t &tick) {
-       // Read ciphertext from flash
-       // ...existing read logic...
-       
-       // Derive page key from LPN
-       uint8_t pageKey[32];
-       if (!edm_->derivePageKey(req.lpn, version, pageKey)) {
-           // Key was punctured - return error
-           return DELETED_DATA_ERROR;
-       }
-       
-       // Decrypt data after reading from flash
-       edm_->decryptPage(pageKey, ciphertext, PAGE_SIZE, tag, plaintext);
-   }
-   ```
-
-3. **Trim Path** (Secure Deletion):
-   ```cpp
-   void PageMapping::trimInternal(Request &req, uint64_t &tick) {
-       if (secureDeleteEnabled && req.secureDeleteFlag) {
-           switch (deletionPolicy) {
-               case POLICY_VCSD:
-                   // VCSD: Puncture file ID (instant)
-                   edm_->punctureFileID(req.fileID);
-                   tick += PUNCTURE_LATENCY;
-                   break;
-               
-               case POLICY_CRYPTOERASE:
-                   // CryptoErase: Delete key from key manager
-                   edm_->deleteKey(req.lpn);
-                   tick += KEY_DELETE_LATENCY;
-                   break;
-               
-               case POLICY_OVERWRITE:
-                   // Traditional: Overwrite with zeros
-                   performOverwrite(req, tick);
-                   break;
-               
-               case POLICY_SANITIZE:
-                   // Sanitize: Cryptographic erase + physical erase
-                   edm_->deleteKey(req.lpn);
-                   performErase(req, tick);
-                   break;
-           }
-       } else {
-           // Normal trim - just invalidate mapping
-           invalidateMapping(req.lpn);
-       }
-   }
-   ```
-
-### 2.2 **Metadata Storage**
-**Add to FTL**:
-- FileID to LPN mapping (which pages belong to which file)
-- Version tracking per LPN (for rewrites)
-- Encryption metadata (IV, tag) storage alongside data
-
----
-
-## Phase 3: Baseline Algorithms Implementation (Week 3-4)
-
-### 3.1 **Implement Comparison Algorithms**
-**Location**: `vcsd/core/edm/baseline_algorithms.cc`
-
-**Algorithms to implement**:
-
-1. **Traditional Overwrite** (NIST 800-88 compliant)
-   - Single-pass overwrite with zeros
-   - Multi-pass overwrite (3-pass, 7-pass options)
-   - Measure: Time, write amplification, wear
-
-2. **CryptoErase** (Key-based deletion)
-   - Per-chunk key management (coarser than VCSD)
-   - Key deletion for secure deletion
-   - Compare with VCSD granularity
-
-3. **Sanitize** (Combined crypto + physical)
-   - Key deletion + block erase
-   - Full erase verification
-   - High security but high cost
-
-4. **Secure Erase** (ATA/NVMe native)
-   - Simulate vendor-specific secure erase
-   - Block-level erase operations
-   - Measure latency and effectiveness
-
-### 3.2 **Policy Configuration**
-**Location**: `config/vcsd_policies.cfg`
-
-```ini
-[SecureDeletion]
-# Policy: VCSD | CRYPTOERASE | OVERWRITE | SANITIZE | SECUREERASE
-Policy = VCSD
-
-[VCSD]
-# File-level granularity
-KeyHierarchy = Master->File->Page
-PunctureLatency = 500ns
-
-[CryptoErase]
-# Chunk-level granularity (e.g., 1MB chunks)
-ChunkSize = 1048576
-KeyPerChunk = true
-
-[Overwrite]
-# Number of overwrite passes
-Passes = 1
-Pattern = ZEROS  # ZEROS | RANDOM | NIST
+**File**: `vcsd/interface/vcsd_controller.cc`
+```cpp
+VCSDController::DeletionResult 
+VCSDController::processSecureDeletion(uint64_t groupId, ...) {
+    DeletionResult result;
+    
+    // Step 1: Capture pre-state
+    PCD::SystemSnapshot preState = captureSystemState();
+    preState.computeMerkleRoot();  // Uses Merkle tree
+    
+    // Step 2: Plan deletion
+    PCD::DeletionPlan plan;
+    if (useVCSD) {
+        // VCSD: Just puncture (no physical operations)
+        plan.ppkPunctures.push_back({groupId, pageList});
+        plan.estimatedLatencyUs = 0.5;  // Puncture latency
+        result.numErasures = 0;        // No block erases!
+        result.numMigrations = 0;       // No data movement!
+    } else {
+        // Baseline: Physical erase
+        plan.blockErasures = calculateBlocksToErase(groupId);
+        plan.estimatedLatencyUs = calculateEraseLatency(plan);
+        result.numErasures = plan.blockErasures.size();
+        result.numMigrations = countValidPages(plan.blockErasures);
+    }
+    
+    // Step 3: Execute deletion
+    auto startTime = getCurrentTime();
+    if (useVCSD) {
+        prf_->puncture(groupId);  // Cryptographic deletion
+    } else {
+        performPhysicalErase(plan.blockErasures);  // Traditional
+    }
+    result.latency = getCurrentTime() - startTime;
+    
+    // Step 4: Capture post-state
+    PCD::SystemSnapshot postState = captureSystemState();
+    postState.computeMerkleRoot();
+    
+    // Step 5: Generate PCD receipt (USING PCD GENERATOR)
+    PCD::DeletionRequest request;
+    request.requestId = generateRequestId();
+    request.lbaRanges = getLbaRanges(groupId);
+    request.timestamp = timestamp;
+    
+    result.receipt = pcdGenerator_->generateReceipt(
+        request, preState, plan, postState
+    );
+    
+    // Step 6: Calculate energy
+    result.energyCost = calculateEnergy(result.numErasures, result.numMigrations);
+    
+    return result;
+}
 ```
 
----
+### Phase 2: SimpleSSD FTL Integration
 
-## Phase 4: Performance Measurement Framework (Week 4-5)
-
-### 4.1 **Benchmarking Infrastructure**
-**Location**: `vcsd/benchmark/`
-
-**Files to create**:
-- `benchmark_runner.hh/cc` - Run experiments with different policies
-- `metrics_collector.hh/cc` - Collect performance metrics
-- `trace_generator.hh/cc` - Generate realistic workloads
-
-**Metrics to collect**:
+**File**: `simplessd/ftl/page_mapping.hh`
 ```cpp
-struct DeletionMetrics {
-    uint64_t deletionLatency;      // Time to complete deletion
-    uint64_t verificationTime;      // Time to verify deletion
-    uint64_t writeAmplification;    // Extra writes caused
-    uint64_t energyConsumption;     // Energy cost
-    uint64_t wearLeveling;          // Impact on flash wear
-    bool dataRecoverable;           // Security verification
+#include "vcsd/interface/vcsd_controller.hh"  // ADD
+
+class PageMapping : public AbstractFTL {
+private:
+    std::unique_ptr<VCSD::VCSDController> vcsdController_;  // ADD
+    
+    // Comparison mode
+    enum DeletionMode {
+        TRADITIONAL_ERASE,   // Baseline
+        VCSD_CRYPTO         // Our approach
+    };
+    DeletionMode deletionMode_;
+```
+
+**File**: `simplessd/ftl/page_mapping.cc`
+```cpp
+void PageMapping::trimInternal(Request &req, uint64_t &tick) {
+    if (req.secureDelete) {
+        // Use VCSD Controller for secure deletion
+        auto result = vcsdController_->processSecureDeletion(
+            req.groupId, req.lpn, req.length, tick, 
+            deletionMode_ == VCSD_CRYPTO
+        );
+        
+        // Update tick with actual latency
+        tick += result.latency;
+        
+        // Update statistics for paper
+        stats.deletions++;
+        stats.totalErasures += result.numErasures;
+        stats.totalMigrations += result.numMigrations;
+        stats.totalEnergy += result.energyCost;
+        
+        // Store PCD receipt for verification
+        receipts_.push_back(result.receipt);
+        
+    } else {
+        // Normal trim - just invalidate mapping
+        invalidateMapping(req.lpn);
+    }
+}
+```
+
+### Phase 3: Baseline Implementation
+
+**File**: `vcsd/core/baseline/erasure_based.hh`
+```cpp
+namespace VCSD {
+namespace Baseline {
+
+class ErasureBasedDeletion {
+public:
+    struct Result {
+        uint64_t latency;           // Total time
+        uint32_t numErasures;       // Block erases performed
+        uint32_t numMigrations;     // Valid pages moved
+        uint64_t energyCost;        // Energy consumption
+    };
+    
+    Result performDeletion(const std::vector<uint32_t>& blocks);
+    
+private:
+    uint64_t calculateEraseLatency(uint32_t numBlocks);
+    uint64_t calculateMigrationLatency(uint32_t numPages);
+    uint64_t calculateEnergy(uint32_t erases, uint32_t migrations);
+};
+
+}}
+```
+
+### Phase 4: Metrics Collection (For Figures)
+
+**File**: `vcsd/benchmark/metrics_collector.hh`
+```cpp
+struct ExperimentMetrics {
+    // Figure 10 metrics
+    std::vector<uint64_t> deletionCosts;
+    std::vector<uint32_t> erasures;
+    std::vector<uint32_t> migrations;
+    
+    // Figure 11 metrics (GC impact)
+    std::vector<uint32_t> gcErasures;
+    std::vector<uint32_t> gcMigrations;
+    
+    // Figure 12 metrics
+    std::vector<uint64_t> programDelays;
+    std::vector<uint64_t> energyConsumption;
+    
+    void exportToCSV(const std::string& filename);
+    void generateGraphs();  // Generate figures like shown
 };
 ```
 
-### 4.2 **Workload Scenarios**
-1. **File deletion workload**: Create files, delete them, measure
-2. **Mixed workload**: Read/write with periodic deletions
-3. **Database workload**: Transaction logs with frequent deletes
-4. **Cloud storage**: Large files with infrequent deletes
-
-### 4.3 **Comparison Metrics**
-- **Performance**: Deletion latency (μs)
-- **Efficiency**: Write amplification factor
-- **Durability**: Flash wear impact (P/E cycles)
-- **Security**: Data recoverability (forensic analysis)
-- **Scalability**: Performance with increasing file count
-
 ---
 
-## Phase 5: Integration & Testing (Week 5-6)
+## What to REMOVE (Cleanup)
 
-### 5.1 **CMakeLists.txt Updates**
-Add EDM module to build system:
-```cmake
-# EDM sources
-set(EDM_SOURCES
-    vcsd/core/edm/encryption_manager.cc
-    vcsd/core/edm/deletion_policy.cc
-    vcsd/core/edm/baseline_algorithms.cc
-)
+### ❌ Delete EncryptionManager
+**Reason**: Redundant for simulation, adds no value to research
 
-# Link with SimpleSSD FTL
-target_link_libraries(simplessd-ftl vcsd_edm OpenSSL::Crypto)
+```bash
+rm vcsd/core/edm/encryption_manager.{hh,cc}
+rm vcsd/tests/encryption_manager_test.cc
 ```
 
-### 5.2 **Test Suite**
-**Location**: `vcsd/tests/integration/`
-
-1. **Unit tests**: Each deletion policy independently
-2. **Integration tests**: Full SSD simulation with workloads
-3. **Security tests**: Verify data is truly irrecoverable
-4. **Performance tests**: Compare all algorithms
-
-### 5.3 **Validation**
-- Functional correctness: All data operations work with encryption
-- Security validation: Deleted data cannot be recovered
-- Performance validation: VCSD outperforms baselines
-- Wear validation: Flash lifetime not significantly impacted
+### ❌ Keep but don't expand encryption_latency
+**Reason**: Already does what we need (latency modeling)
 
 ---
 
-## Phase 6: Experimental Evaluation (Week 6-7)
+## Expected Results (Like Figures Shown)
 
-### 6.1 **Experimental Setup**
-**Configuration**:
-- SSD: 256GB capacity, 4KB page size
-- NAND: TLC, 3000 P/E cycles
-- Workloads: FileBench, YCSB, TPC-C
-- Policies: VCSD vs CryptoErase vs Overwrite vs Sanitize
+### VCSD vs Erasure-Based:
 
-### 6.2 **Key Research Questions**
-1. **RQ1**: How does VCSD deletion latency compare to traditional methods?
-   - Hypothesis: VCSD is 100-1000× faster
+| Metric | Erasure-Based | VCSD (Crypto) | Improvement |
+|--------|---------------|---------------|-------------|
+| Deletion cost | 38740 μs | 69 μs | **561×** faster |
+| Erasures | 933 | 0 | **Infinite** (no physical erase) |
+| Migrations | 6586 | 0 | **Infinite** (no data movement) |
+| GC impact | High | Minimal | Lower GC overhead |
+| Energy | 48J | 34J | **29%** less energy |
 
-2. **RQ2**: What is the write amplification of different policies?
-   - Hypothesis: VCSD has near-zero write amplification
-
-3. **RQ3**: How does deletion policy affect overall SSD lifetime?
-   - Hypothesis: VCSD minimizes flash wear
-
-4. **RQ4**: What is the performance overhead of encryption?
-   - Hypothesis: AES-GCM with AES-NI has <5% overhead
-
-5. **RQ5**: How does file granularity affect deletion efficiency?
-   - Compare: VCSD (per-file) vs CryptoErase (per-chunk)
-
-### 6.3 **Expected Results**
-- **Deletion Latency**: VCSD ~0.5μs vs Overwrite ~10ms (20,000× speedup)
-- **Write Amplification**: VCSD 1.0× vs Overwrite 3-5×
-- **Flash Wear**: VCSD minimal vs Overwrite significant
-- **Security**: All crypto-based methods provide provable security
+### Why VCSD wins:
+1. **No block erases** → Puncture is instant
+2. **No migrations** → No valid data movement
+3. **Minimal GC impact** → Fewer blocks invalidated
+4. **Lower energy** → No flash operations
 
 ---
 
 ## Implementation Priority
 
-### **Critical Path (Must Have)**:
-1. ✅ AES-GCM encryption/decryption implementation
-2. ✅ Master key usage in encryption (not just derivation)
-3. ✅ FTL write path integration
-4. ✅ FTL read path integration
-5. ✅ VCSD puncture-based deletion
+1. **Complete VCSD deletion with PCD** (use Merkle + PCD Generator)
+2. **SimpleSSD FTL integration** (hook VCSD Controller)
+3. **Baseline erasure algorithm** (for comparison)
+4. **Metrics collection** (reproduce figures)
+5. **Cleanup** (remove EncryptionManager)
 
-### **High Priority (Should Have)**:
-6. CryptoErase baseline implementation
-7. Traditional overwrite implementation
-8. Performance measurement framework
-9. Basic benchmarking workloads
-
-### **Medium Priority (Nice to Have)**:
-10. Sanitize policy implementation
-11. Advanced workload traces
-12. Energy consumption modeling
-13. Comprehensive test suite
-
-### **Low Priority (Future Work)**:
-14. Hardware accelerator simulation (AES-NI)
-15. Multi-tenancy support
-16. Remote verification protocol
-17. Real-world trace replay
-
----
-
-## File Structure (After Implementation)
-
-```
-vcsd/
-├── core/
-│   ├── ppk/              (existing - Puncturable PRF)
-│   ├── crypto/           (existing - latency models)
-│   ├── edm/              (NEW - Encryption/Deletion Manager)
-│   │   ├── encryption_manager.hh/cc
-│   │   ├── deletion_policy.hh/cc
-│   │   └── baseline_algorithms.hh/cc
-│   ├── merkle/           (existing - PCD support)
-│   └── pcd/              (existing - receipts)
-├── interface/
-│   ├── vcsd_controller.hh/cc  (modify - add EDM integration)
-│   └── trace_parser.hh/cc     (existing)
-├── benchmark/            (NEW)
-│   ├── benchmark_runner.hh/cc
-│   ├── metrics_collector.hh/cc
-│   └── workload_generator.hh/cc
-├── tests/
-│   ├── integration/      (NEW - full system tests)
-│   └── ...existing tests...
-└── INTEGRATION_PLAN.md   (this file)
-
-simplessd/
-└── ftl/
-    ├── page_mapping.hh/cc    (modify - add crypto)
-    ├── ftl.hh/cc             (modify - add EDM)
-    └── ...existing files...
-```
-
----
-
-## Next Steps (Immediate Actions)
-
-1. **Create EDM module structure**
-   ```bash
-   mkdir -p vcsd/core/edm
-   mkdir -p vcsd/benchmark
-   mkdir -p vcsd/tests/integration
-   ```
-
-2. **Implement AES-GCM encryption layer**
-   - Start with `encryption_manager.cc`
-   - Use OpenSSL EVP API
-   - Test with known vectors
-
-3. **Modify FTL write path**
-   - Add encryption before PAL write
-   - Store ciphertext + authentication tag
-
-4. **Modify FTL read path**
-   - Add decryption after PAL read
-   - Verify authentication tag
-
-5. **Implement secure trim**
-   - VCSD: puncture file ID
-   - Baseline: overwrite/erase
-
-6. **Build test workload**
-   - Simple write→read→delete cycle
-   - Measure latencies
-
-7. **Iterate and optimize**
-   - Profile performance
-   - Compare with baselines
-   - Refine implementation
-
----
-
-## Success Criteria
-
-- ✅ All data written is encrypted with AES-256-GCM
-- ✅ Master key is actually used for encryption (not just stored)
-- ✅ VCSD deletion works via puncturing (instant)
-- ✅ Baseline algorithms implemented and working
-- ✅ Performance measurements show VCSD advantages
-- ✅ Integration with SimpleSSD FTL complete
-- ✅ Test suite passes all tests
-- ✅ Research paper has quantitative comparison data
+Should I proceed with this corrected implementation?
